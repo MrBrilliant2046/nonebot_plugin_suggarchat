@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from copy import deepcopy
+import base64
+import mimetypes
+from urllib.parse import urlparse
 
 import nonebot
 import openai
@@ -17,10 +20,31 @@ from openai.types.chat.chat_completion_tool_choice_option_param import (
     ChatCompletionToolChoiceOptionParam,
 )
 
+try:
+    import httpx  # 用于下载图片为字节
+except Exception:  # pragma: no cover
+    httpx = None
+
 from ..chatmanager import chat_manager
 from ..config import config_manager
 from .functions import remove_think_tag
 from .protocol import AdapterManager, ModelAdapter
+
+
+# 单图最大下载字节，超过则放弃 data URL 转换（避免请求过大）
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8MB，可按需调整
+
+
+def _is_http_url(s: str) -> bool:
+    try:
+        p = urlparse(s)
+        return p.scheme in ("http", "https")
+    except Exception:
+        return False
+
+
+def _is_data_url(s: str) -> bool:
+    return isinstance(s, str) and s.startswith("data:")
 
 
 async def tools_caller(
@@ -28,53 +52,66 @@ async def tools_caller(
     tools: list,
     tool_choice: ChatCompletionToolChoiceOptionParam | None = None,
 ) -> ChatCompletionMessage:
+    """当模型不支持 tools 时优雅降级为普通对话，避免抛错中断"""
     if not tool_choice:
         tool_choice = (
             "required"
             if (
                 config_manager.config.llm_config.tools.require_tools and len(tools) > 1
-            )  # 排除默认工具
+            )
             else "auto"
         )
     config = config_manager.config
-    preset_list = [config.preset, *deepcopy(config.preset_extension.backup_preset_list)]
+    preset_list = [config.preset, *config.preset_extension.backup_preset_list]
     err: None | Exception = None
     if not preset_list:
         preset_list = ["default"]
+
     for name in preset_list:
         try:
             preset = await config_manager.get_preset(name)
-
             if preset.protocol not in ("__main__", "openai"):
                 continue
-            base_url = preset.base_url
-            key = preset.api_key
-            model = preset.model
 
-            logger.debug(f"开始获取 {preset.model} 的带有工具的对话")
-            logger.debug(f"预设：{name}")
-            logger.debug(f"密钥：{preset.api_key[:7]}...")
-            logger.debug(f"协议：{preset.protocol}")
-            logger.debug(f"API地址：{preset.base_url}")
             client = openai.AsyncOpenAI(
-                base_url=base_url, api_key=key, timeout=config.llm_config.llm_timeout
+                base_url=preset.base_url,
+                api_key=preset.api_key,
+                timeout=config.llm_config.llm_timeout,
             )
-            completion: ChatCompletion = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=False,
-                tool_choice=tool_choice,
-                tools=tools,
-            )
-            return completion.choices[0].message
+
+            # 首选尝试带 tools 的调用
+            try:
+                completion: ChatCompletion = await client.chat.completions.create(
+                    model=preset.model,
+                    messages=messages,
+                    stream=False,
+                    tool_choice=tool_choice,
+                    tools=tools,
+                )
+                return completion.choices[0].message
+            except Exception as e:
+                msg = str(e)
+                # 模型不支持 tools 的典型报错，降级为普通对话
+                if isinstance(e, openai.NotFoundError) or "tools is not supported" in msg or "function calling" in msg:
+                    logger.warning(f"[OpenAI] 模型 {preset.model} 不支持 tools，降级为普通对话")
+                    fallback: ChatCompletion = await client.chat.completions.create(
+                        model=preset.model,
+                        messages=messages,
+                        stream=False,
+                    )
+                    return fallback.choices[0].message
+                # 其他错误继续抛给外层轮换/重试逻辑
+                raise
 
         except Exception as e:
             logger.warning(f"[OpenAI] {name} 模型调用失败: {e}")
             err = e
             continue
-    logger.warning("Tools调用因为没有OPENAI协议模型而失败")
+
+    logger.warning("Tools调用因为没有可用的 OPENAI 协议模型而失败")
     if err is not None:
         raise err
+    # 返回一个空消息对象，保持调用方类型一致
     return ChatCompletionMessage(role="assistant", content="")
 
 
@@ -147,8 +184,10 @@ async def get_chat(
         raise err
     return ""
 
+
 class OpenAIAdapter(ModelAdapter):
     """OpenAI协议适配器"""
+
     @staticmethod
     def _normalize_content_parts(parts):
         """将消息的多模态分片规范为 OpenAI 要求的结构"""
@@ -196,6 +235,7 @@ class OpenAIAdapter(ModelAdapter):
             fallback = part.get("text") or part.get("content") or ""
             normalized.append({"type": "text", "text": str(fallback)})
         return normalized
+
     @staticmethod
     def _strip_image_parts(messages: Iterable[ChatCompletionMessageParam]) -> list[ChatCompletionMessageParam]:
         """移除消息中的所有 image_url 分片；若消息因此为空，则放入一个空文本分片，避免 400。"""
@@ -216,6 +256,79 @@ class OpenAIAdapter(ModelAdapter):
             cleaned.append(msg)
         return cleaned
 
+    async def _download_to_data_url(self, url: str) -> str | None:
+        """下载图片并转换为 data URL。失败或过大返回 None。"""
+        if not httpx:
+            logger.warning("未安装 httpx，跳过将图片URL转换为 data URL（保留原URL）。")
+            return None
+        try:
+            timeout = config_manager.config.llm_config.llm_timeout
+            async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+                # 先 HEAD 获取大小
+                content_length = None
+                try:
+                    h = await client.head(url)
+                    if h.status_code // 100 == 2:
+                        cl = h.headers.get("Content-Length")
+                        if cl and cl.isdigit():
+                            content_length = int(cl)
+                except Exception:
+                    pass  # 有些服务不支持 HEAD
+
+                if content_length is not None and content_length > _MAX_IMAGE_BYTES:
+                    logger.warning(f"图片过大（{content_length} 字节），放弃转换为 data URL：{url}")
+                    return None
+
+                r = await client.get(url)
+                if r.status_code // 100 != 2:
+                    logger.warning(f"下载图片失败，HTTP {r.status_code}：{url}")
+                    return None
+                data = r.content
+                if content_length is None and len(data) > _MAX_IMAGE_BYTES:
+                    logger.warning(f"图片过大（{len(data)} 字节），放弃转换为 data URL：{url}")
+                    return None
+
+                ctype = r.headers.get("Content-Type")
+                if not ctype:
+                    ctype = mimetypes.guess_type(url)[0] or "application/octet-stream"
+                b64 = base64.b64encode(data).decode("ascii")
+                return f"data:{ctype};base64,{b64}"
+        except Exception as e:
+            logger.warning(f"下载/转换图片为 data URL 失败：{e}")
+            return None
+
+    async def _convert_images_to_data_urls(
+        self, messages: Iterable[ChatCompletionMessageParam]
+    ) -> list[ChatCompletionMessageParam]:
+        """将消息中 http(s) 的图片 URL 转换为 data URL；已是 data: 的跳过。"""
+        converted: list[ChatCompletionMessageParam] = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, list):
+                    new_parts: list = []
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "image_url":
+                            iu = p.get("image_url")
+                            if isinstance(iu, str):
+                                url = iu
+                                if _is_http_url(url) and not _is_data_url(url):
+                                    data_url = await self._download_to_data_url(url)
+                                    if data_url:
+                                        p = {"type": "image_url", "image_url": {"url": data_url}}
+                            elif isinstance(iu, dict):
+                                url = iu.get("url")
+                                if isinstance(url, str) and _is_http_url(url) and not _is_data_url(url):
+                                    data_url = await self._download_to_data_url(url)
+                                    if data_url:
+                                        # 保留 detail 等其他字段
+                                        new_iu = {**iu, "url": data_url}
+                                        p = {"type": "image_url", "image_url": new_iu}
+                        new_parts.append(p)
+                    msg = {**msg, "content": new_parts}
+            converted.append(msg)
+        return converted
+
     async def call_api(self, messages: Iterable[ChatCompletionMessageParam]) -> str:
         """调用OpenAI API获取聊天响应"""
         preset = self.preset
@@ -234,6 +347,12 @@ class OpenAIAdapter(ModelAdapter):
                 if isinstance(content, list):
                     msg = {**msg, "content": self._normalize_content_parts(content)}
             norm_messages.append(msg)
+
+        # 将图片 URL 转换为 data URL，避免上游抓图失败
+        try:
+            norm_messages = await self._convert_images_to_data_urls(norm_messages)
+        except Exception as e:
+            logger.warning(f"转换图片为 data URL 过程中出现异常，跳过转换：{e}")
 
         completion: ChatCompletion | openai.AsyncStream[ChatCompletionChunk] | None = None
 

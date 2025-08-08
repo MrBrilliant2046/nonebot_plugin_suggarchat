@@ -123,30 +123,82 @@ def split_message_into_chats(text: str, max_length: int = 100) -> list[str]:
 
 
 def convert_to_utf8(file_path) -> bool:
-    """将文件编码转换为 UTF-8"""
+    """将文件编码转换为 UTF-8（更稳健的多编码尝试版本）"""
     if not config_manager.config.encoding_settings.force_utf8:
         return False
+
     file_path = str(file_path)
-    with open(file_path, "rb") as file:
-        raw_data = file.read()
-        result = chardet.detect(raw_data)
-        encoding = result["encoding"]
-    if encoding is None:
-        try:
-            with open(file_path) as f:
-                contents = f.read()
-                if contents.strip() == "":
-                    return True
-        except Exception:
-            logger.warning(f"无法读取文件{file_path}")
-            return False
-        logger.warning(f"无法检测到编码{file_path}")
+    try:
+        with open(file_path, "rb") as f:
+            raw = f.read()
+    except Exception as e:
+        logger.warning(f"无法以二进制读取文件 {file_path}: {e}")
         return False
-    with open(file_path, encoding=encoding) as file:
-        content = file.read()
-    with open(file_path, "w", encoding="utf-8") as file:
-        file.write(content)
-    return True
+
+    # 空文件直接视为成功
+    if not raw or raw.strip() == b"":
+        return True
+
+    # 先探测，但不盲信
+    detected = None
+    try:
+        result = chardet.detect(raw)
+        detected = result.get("encoding")
+    except Exception:
+        pass
+
+    # 依次尝试这些编码（无损解码优先）
+    candidates = [
+        "utf-8",
+        "utf-8-sig",
+    ]
+    if detected:
+        candidates.append(detected)
+    candidates += [
+        "gb18030",
+        "gbk",
+        "big5",
+        "shift_jis",
+        "cp1252",   # 比 cp1254 宽容些
+        "latin-1",  # 兜底：单字节映射，不会失败，但可能出现字符偏差
+    ]
+
+    # 去重但保序
+    seen = set()
+    ordered_candidates = []
+    for enc in candidates:
+        if enc and enc.lower() not in seen:
+            seen.add(enc.lower())
+            ordered_candidates.append(enc)
+
+    text = None
+    for enc in ordered_candidates:
+        try:
+            text = raw.decode(enc)
+            break
+        except Exception:
+            continue
+
+    # 最后兜底：忽略无法解码的字节，尽量保住结构
+    if text is None:
+        for enc in ordered_candidates:
+            try:
+                text = raw.decode(enc, errors="ignore")
+                break
+            except Exception:
+                continue
+
+    if text is None:
+        logger.warning(f"无法将文件 {file_path} 解码为文本（多编码尝试失败）")
+        return False
+
+    try:
+        with open(file_path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        return True
+    except Exception as e:
+        logger.warning(f"写入 UTF-8 文件 {file_path} 失败: {e}")
+        return False
 
 
 async def synthesize_forward_message(forward_msg: dict, bot: Bot) -> str:
