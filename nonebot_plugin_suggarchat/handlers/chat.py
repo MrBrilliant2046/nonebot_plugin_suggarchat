@@ -121,9 +121,12 @@ async def chat(event: MessageEvent, matcher: Matcher, bot: Bot):
                     },
                 ]
                 + [
-                    {"type": "input_image", "url": seg.data.get("url")}
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": seg.data.get("url")},
+                    }
                     for seg in event.message
-                    if seg.data.get("type") == "image"
+                    if getattr(seg, "type", None) == "image" and seg.data.get("url")
                 ]
                 if is_multimodal
                 else f"[{role}][{Date}][{user_name}（{user_id}）]说:{content}"
@@ -214,9 +217,12 @@ async def chat(event: MessageEvent, matcher: Matcher, bot: Bot):
                     },
                 ]
                 + [
-                    {"type": "input_image", "url": seg.data.get("url")}
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": seg.data.get("url")},
+                    }
                     for seg in event.message
-                    if seg.data.get("type") == "image"
+                    if getattr(seg, "type", None) == "image" and seg.data.get("url")
                 ]
                 if is_multimodal
                 else f"{Date}{await get_friend_name(event.user_id, bot=bot)}（{event.user_id}）： {content!s}"
@@ -361,15 +367,16 @@ async def chat(event: MessageEvent, matcher: Matcher, bot: Bot):
         ).multimodal
         # Process multimodal messages when needed
         for message in data.memory.messages:
+           # 当当前预设不支持多模态时，将历史里的多模态消息（list 结构）转为纯文本
             if (
-                isinstance(message["content"], dict)
+                isinstance(message.get("content"), list)
                 and not is_multimodal
-                and message["role"] == "user"
+                and message.get("role") == "user"
             ):
                 message_text = ""
                 for content_part in message["content"]:
-                    if content_part["type"] == "text":
-                        message_text += content_part["text"]
+                    if content_part.get("type") == "text":
+                        message_text += content_part.get("text", "")
                 message["content"] = message_text
 
         # Enforce memory length limit

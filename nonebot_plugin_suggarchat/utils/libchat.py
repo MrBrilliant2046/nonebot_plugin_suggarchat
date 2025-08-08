@@ -131,10 +131,10 @@ async def get_chat(
                     continue
                 finally:
                     if (
-                        e is not None
+                        err is not None
                         and not config_manager.config.llm_config.auto_retry
                     ):
-                        raise e
+                        raise err
         except Exception as e:
             logger.warning(f"调用适配器失败{e}")
             err = e
@@ -149,7 +149,53 @@ async def get_chat(
 
 class OpenAIAdapter(ModelAdapter):
     """OpenAI协议适配器"""
-
+    @staticmethod
+    def _normalize_content_parts(parts):
+        """将消息的多模态分片规范为 OpenAI 要求的结构"""
+        normalized = []
+        for part in parts:
+            # 纯字符串转文本分片
+            if isinstance(part, str):
+                normalized.append({"type": "text", "text": part})
+                continue
+            if not isinstance(part, dict):
+                normalized.append({"type": "text", "text": str(part)})
+                continue
+            t = part.get("type")
+            # 兼容旧写法 input_image/url
+            if t == "input_image":
+                url = part.get("url") or part.get("image_url")
+                if isinstance(url, str):
+                    normalized.append({"type": "image_url", "image_url": {"url": url}})
+                elif isinstance(url, dict) and url.get("url"):
+                    normalized.append({"type": "image_url", "image_url": url})
+                else:
+                    # 无法识别则降级为空文本，避免 400
+                    normalized.append({"type": "text", "text": ""})
+                continue
+            # 正确写法 image_url 对象
+            if t == "image_url":
+                iu = part.get("image_url")
+                if isinstance(iu, str):
+                    normalized.append({"type": "image_url", "image_url": {"url": iu}})
+                elif isinstance(iu, dict) and iu.get("url"):
+                    normalized.append(part)
+                else:
+                    normalized.append({"type": "text", "text": ""})
+                continue
+            # 文本分片规范化
+            if t == "text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    normalized.append({"type": "text", "text": text})
+                else:
+                    fallback = part.get("content") or ""
+                    normalized.append({"type": "text", "text": str(fallback)})
+                continue
+            # 其他未知类型，尽量转文本
+            fallback = part.get("text") or part.get("content") or ""
+            normalized.append({"type": "text", "text": str(fallback)})
+        return normalized
     async def call_api(self, messages: Iterable[ChatCompletionMessageParam]) -> str:
         """调用OpenAI API获取聊天响应"""
         preset = self.preset
@@ -159,13 +205,21 @@ class OpenAIAdapter(ModelAdapter):
             api_key=preset.api_key,
             timeout=config.llm_config.llm_timeout,
         )
+        # 规范化多模态消息结构，避免 image_url 为字符串等无效格式
+        norm_messages: list[ChatCompletionMessageParam] = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, list):
+                    msg = {**msg, "content": self._normalize_content_parts(content)}
+            norm_messages.append(msg)  # 不是 dict 的情况保持原样
         completion: ChatCompletion | openai.AsyncStream[ChatCompletionChunk] | None = (
             None
         )
 
         completion = await client.chat.completions.create(
             model=preset.model,
-            messages=messages,
+            messages=norm_messages,
             max_tokens=config.llm_config.max_tokens,
             stream=config.llm_config.stream,
         )
