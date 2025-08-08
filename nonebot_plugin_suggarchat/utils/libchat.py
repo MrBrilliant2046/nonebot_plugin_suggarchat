@@ -196,6 +196,26 @@ class OpenAIAdapter(ModelAdapter):
             fallback = part.get("text") or part.get("content") or ""
             normalized.append({"type": "text", "text": str(fallback)})
         return normalized
+    @staticmethod
+    def _strip_image_parts(messages: Iterable[ChatCompletionMessageParam]) -> list[ChatCompletionMessageParam]:
+        """移除消息中的所有 image_url 分片；若消息因此为空，则放入一个空文本分片，避免 400。"""
+        cleaned: list[ChatCompletionMessageParam] = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, list):
+                    new_parts = []
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "image_url":
+                            # 跳过图片分片
+                            continue
+                        new_parts.append(p)
+                    if not new_parts:
+                        new_parts = [{"type": "text", "text": ""}]
+                    msg = {**msg, "content": new_parts}
+            cleaned.append(msg)
+        return cleaned
+
     async def call_api(self, messages: Iterable[ChatCompletionMessageParam]) -> str:
         """调用OpenAI API获取聊天响应"""
         preset = self.preset
@@ -205,6 +225,7 @@ class OpenAIAdapter(ModelAdapter):
             api_key=preset.api_key,
             timeout=config.llm_config.llm_timeout,
         )
+
         # 规范化多模态消息结构，避免 image_url 为字符串等无效格式
         norm_messages: list[ChatCompletionMessageParam] = []
         for msg in messages:
@@ -212,19 +233,30 @@ class OpenAIAdapter(ModelAdapter):
                 content = msg.get("content")
                 if isinstance(content, list):
                     msg = {**msg, "content": self._normalize_content_parts(content)}
-            norm_messages.append(msg)  # 不是 dict 的情况保持原样
-        completion: ChatCompletion | openai.AsyncStream[ChatCompletionChunk] | None = (
-            None
-        )
+            norm_messages.append(msg)
 
-        completion = await client.chat.completions.create(
-            model=preset.model,
-            messages=norm_messages,
-            max_tokens=config.llm_config.max_tokens,
-            stream=config.llm_config.stream,
-        )
+        completion: ChatCompletion | openai.AsyncStream[ChatCompletionChunk] | None = None
+
+        async def _do_create(req_messages: list[ChatCompletionMessageParam]):
+            return await client.chat.completions.create(
+                model=preset.model,
+                messages=req_messages,
+                max_tokens=config.llm_config.max_tokens,
+                stream=config.llm_config.stream,
+            )
+
+        try:
+            completion = await _do_create(norm_messages)
+        except Exception as e:
+            # 上游统计 token 或抓取图片失败时的常见报错，移除图片后重试一次
+            msg = str(e)
+            if ("fail to get image from url" in msg) or ("count_token_messages_failed" in msg):
+                fallback_messages = self._strip_image_parts(norm_messages)
+                completion = await _do_create(fallback_messages)
+            else:
+                raise
+
         response: str = ""
-        # 处理流式响应
         if config.llm_config.stream and isinstance(completion, openai.AsyncStream):
             async for chunk in completion:
                 try:
@@ -236,7 +268,7 @@ class OpenAIAdapter(ModelAdapter):
                     break
         else:
             if chat_manager.debug:
-                logger.debug(response)
+                logger.debug(completion)
             if isinstance(completion, ChatCompletion):
                 response = (
                     completion.choices[0].message.content
@@ -245,8 +277,8 @@ class OpenAIAdapter(ModelAdapter):
                 )
             else:
                 raise RuntimeError("收到意外的响应类型")
-        return response if response is not None else ""
 
+        return response if response is not None else ""
     @staticmethod
     def get_adapter_protocol() -> tuple[str, ...]:
         return "openai", "__main__"
